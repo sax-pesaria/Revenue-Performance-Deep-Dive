@@ -1,4 +1,3 @@
-/* no dependencies */
 DROP TABLE IF EXISTS public.product_performance_combined;
 BEGIN;
 CREATE TABLE public.product_performance_combined
@@ -38,269 +37,416 @@ productmap AS (
     ) ranked
     WHERE rn = 1
 ),
+market_category_level AS (
+    SELECT DISTINCT * 
+    FROM public.market_performance_category_combined
+),
+base_metrics AS (
+    SELECT 
+        /* IDENTIFIERS */
+        COALESCE(current.snapshot_month, prior.snapshot_month_py) AS month,
+        COALESCE(current.product_id, prior.product_id) AS product_id,
+        pm.item_name,
+        pm.manufacturer_name,
+        pm.product_type,
+        pm.product_group,
+        pm.product_group_desc,
+        pm.is_deleted,
+        pm.is_discontinued,
+        pm.discontinued_date,
+        pm.creation_date,
+        pm.seller_name,
+        pm.marketplace_name,
+        pm.category_id,
+        pm.brand_name,
+        COALESCE(current.marketplace_id, prior.marketplace_id) AS marketplace_id_code,
+        COALESCE(current.fulfillment_channel, prior.fulfillment_channel) AS channel,
+        COALESCE(current.seller_id, prior.seller_id) AS seller_id,
 
-market_category_level as (select distinct * from public.market_performance_category_combined)
-
-SELECT 
-    /* IDENTIFIERS */
-    COALESCE(current.snapshot_month, prior.snapshot_month_py) AS month,
-    COALESCE(current.product_id, prior.product_id) AS product_id,
-    pm.item_name,
-    pm.manufacturer_name,
-    pm.product_type,
-    pm.product_group,
-    pm.product_group_desc,
-    pm.is_deleted,
-    pm.is_discontinued,
-    pm.discontinued_date,
-    pm.creation_date,
-    pm.seller_name,
-    pm.marketplace_name,
-    pm.category_id,
-    pm.brand_name,
-    COALESCE(current.marketplace_id, prior.marketplace_id) AS marketplace_id_code,
-    COALESCE(current.fulfillment_channel, prior.fulfillment_channel) AS channel,
-    COALESCE(current.seller_id, prior.seller_id) AS seller_id,
-
-    /* TRAFFIC METRICS */
-    COALESCE(current.views_current_seller,0) AS seller_views_current,
-    COALESCE(prior.views_prior_seller,0) AS seller_views_prior,
-    COALESCE(current.views_current_product,0) AS product_views_current,
-    COALESCE(prior.views_prior_product,0) AS product_views_prior,
-    SUM(prior.views_prior_seller) OVER (
-        PARTITION BY COALESCE(current.product_id, prior.product_id),
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS cumulative_prior_views,
-    CASE WHEN COALESCE(current.views_current_product,0)=0 THEN 0
-         ELSE current.views_current_seller::float / NULLIF(current.views_current_product,0)
-    END AS buybox_share_current,
-    CASE WHEN COALESCE(prior.views_prior_product,0)=0 THEN 0
-         ELSE prior.views_prior_seller::float / NULLIF(prior.views_prior_product,0)
-    END AS buybox_share_prior,
-    current.buybox_price,
-    
-    /* DUPLICATE CHANNEL FLAG */
-    CASE 
-        WHEN COUNT(*) OVER (
+        /* TRAFFIC METRICS */
+        COALESCE(current.views_current_seller,0) AS seller_views_current,
+        COALESCE(prior.views_prior_seller,0) AS seller_views_prior,
+        COALESCE(current.views_current_product,0) AS product_views_current,
+        COALESCE(prior.views_prior_product,0) AS product_views_prior,
+        SUM(prior.views_prior_seller) OVER (
             PARTITION BY COALESCE(current.product_id, prior.product_id),
-                         COALESCE(current.marketplace_id, prior.marketplace_id),
-                         COALESCE(current.seller_id, prior.seller_id)
-        ) > 2 
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS cumulative_prior_views,
+        CASE WHEN COALESCE(current.views_current_product,0)=0 THEN 0
+             ELSE current.views_current_seller::float / NULLIF(current.views_current_product,0)
+        END AS buybox_share_current,
+        CASE WHEN COALESCE(prior.views_prior_product,0)=0 THEN 0
+             ELSE prior.views_prior_seller::float / NULLIF(prior.views_prior_product,0)
+        END AS buybox_share_prior,
+        current.buybox_price,
+        
+        /* DUPLICATE CHANNEL FLAG */
+        CASE 
+            WHEN COUNT(*) OVER (
+                PARTITION BY COALESCE(current.product_id, prior.product_id),
+                             COALESCE(current.marketplace_id, prior.marketplace_id),
+                             COALESCE(current.seller_id, prior.seller_id)
+            ) > 2 
+            THEN 'Y'
+            ELSE 'N'
+        END AS duplicate_channel,
+        
+        /* SELECTION LOGIC */
+        CASE 
+            WHEN (current.views_current_seller / NULLIF(prior.views_prior_seller,0) - 1 < -0.975) 
+                 OR pm.is_discontinued = 'Y' 
+                 OR pm.is_deleted = 'Y'
+                 OR (current.views_current_seller = 0 AND prior.views_prior_seller = 0)
+            THEN 'Dismissed Selection' 
+            
+            WHEN (
+                SUM(prior.views_prior_seller) OVER (
+                    PARTITION BY COALESCE(current.product_id, prior.product_id),
+                                 COALESCE(current.marketplace_id, prior.marketplace_id)
+                ) < 1 
+                OR (prior.views_prior_seller IS NULL 
+                    AND current.views_current_seller > 0 
+                    AND pm.creation_date < '2025-01-01')
+            )
+            THEN 'New Offers'
+            
+            WHEN (
+                SUM(prior.views_prior_seller) OVER (
+                    PARTITION BY COALESCE(current.product_id, prior.product_id),
+                                 COALESCE(current.marketplace_id, prior.marketplace_id)
+                ) < 1 
+                OR (prior.views_prior_seller IS NULL 
+                    AND current.views_current_seller > 0 
+                    AND pm.creation_date > '2025-01-01')
+            )
+            THEN 'New Created Products'
+            
+            ELSE 'Current Product Selection'
+        END AS selection_status,
+        
+        /* SALES METRICS */
+        COALESCE(sales_current.units_current,0) AS units_current,
+        COALESCE(sales_current.units_prior,0) AS units_prior,
+        COALESCE(sales_current.revenue_current_local,0) AS revenue_current_local,
+        COALESCE(sales_current.revenue_prior_local,0) AS revenue_prior_local,
+        COALESCE(sales_current.revenue_current_usd,0) AS revenue_current_usd,
+        COALESCE(sales_current.revenue_prior_usd,0) AS revenue_prior_usd,
+        
+        /* ADS RAW METRICS */
+        advertising.impression_count,
+        advertising.click_count,
+        advertising.ad_spend_usd,
+        advertising.attributed_revenue_usd,
+        advertising.attributed_units_sold,
+        advertising.prior_impression_count,
+        advertising.prior_click_count,
+        advertising.prior_ad_spend_usd,
+        advertising.prior_attributed_revenue_usd,
+        advertising.prior_attributed_units_sold,
+        
+        /* MARKET-LEVEL METRICS */
+        SUM(market.views_current) AS market_views_current_pt,
+        SUM(market.views_prior) AS market_views_prior_pt,
+        SUM(market.units_current) AS market_units_current_pt,
+        SUM(market.units_prior) AS market_units_prior_pt,
+        SUM(market.revenue_current) AS market_revenue_local_current_pt,
+        SUM(market.revenue_prior) AS market_revenue_local_prior_pt,
+        SUM(market.revenue_usd_current) AS market_revenue_usd_current_pt,
+        SUM(market.revenue_usd_prior) AS market_revenue_usd_prior_pt,
+        
+        SUM(SUM(market.views_current)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_views_current_pt_total,
+        SUM(SUM(market.views_prior)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_views_prior_pt_total,
+        SUM(SUM(market.units_current)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_units_current_pt_total,
+        SUM(SUM(market.units_prior)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_units_prior_pt_total,
+        SUM(SUM(market.revenue_current)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_revenue_local_current_pt_total,
+        SUM(SUM(market.revenue_prior)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_revenue_local_prior_pt_total,
+        SUM(SUM(market.revenue_usd_current)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_revenue_usd_current_pt_total,
+        SUM(SUM(market.revenue_usd_prior)) OVER (
+            PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
+                         pm.product_type,
+                         COALESCE(current.marketplace_id, prior.marketplace_id)
+        ) AS market_revenue_usd_prior_pt_total,
+        
+        /* CATEGORY METRICS */
+        SUM(cat.units_current) AS market_units_category_current,
+        SUM(cat.revenue_current) AS market_revenue_category_current,
+        SUM(cat.total_units_per_month_category) AS market_total_units_month_category_current,
+        SUM(cat.total_revenue_per_month_category) AS market_total_revenue_month_category_current,
+        SUM(cat.units_prior) AS market_units_category_prior,
+        SUM(cat.revenue_prior) AS market_revenue_category_prior,
+        SUM(cat.total_units_per_month_category_prior) AS market_total_units_month_category_prior,
+        SUM(cat.total_revenue_per_month_category_prior) AS market_total_revenue_month_category_prior
+
+    FROM public.product_views_table_prior prior
+    FULL OUTER JOIN public.product_views_table_current current
+        ON current.snapshot_month = prior.snapshot_month_py
+        AND current.product_id = prior.product_id
+        AND current.marketplace_id = prior.marketplace_id
+        AND current.fulfillment_channel = prior.fulfillment_channel
+    LEFT JOIN public.seller_product_sales_combined sales_current
+        ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = sales_current.activity_month
+        AND COALESCE(current.product_id, prior.product_id) = sales_current.product_id
+        AND COALESCE(current.marketplace_id, prior.marketplace_id) = sales_current.marketplace_id
+        AND COALESCE(current.seller_id, prior.seller_id) = sales_current.seller_id
+        AND CASE 
+            WHEN COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = 'AFN' THEN 'FBA'
+            ELSE COALESCE(current.fulfillment_channel, prior.fulfillment_channel)
+        END = sales_current.channel
+    LEFT JOIN advertising
+        ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = advertising.month
+        AND COALESCE(current.product_id, prior.product_id) = advertising.product_id
+        AND COALESCE(current.marketplace_id, prior.marketplace_id) = advertising.marketplace_id
+        AND COALESCE(current.seller_id, prior.seller_id) = advertising.advertiser_id
+    LEFT JOIN productmap pm 
+        ON COALESCE(current.product_id, prior.product_id) = pm.product_id
+        AND COALESCE(current.marketplace_id, prior.marketplace_id) = pm.marketplace_id
+        AND COALESCE(current.seller_id, prior.seller_id) = pm.seller_id
+    FULL OUTER JOIN public.market_performance_combined market
+        ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = market.activity_month
+        AND COALESCE(current.marketplace_id, prior.marketplace_id) = market.marketplace_id
+        AND pm.product_type = market.product_type
+        AND COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = market.fulfillment_channel
+    LEFT JOIN market_category_level cat 
+        ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = cat.activity_month
+        AND COALESCE(current.marketplace_id, prior.marketplace_id) = cat.marketplace_id
+        AND pm.category_id = cat.category_id 
+        AND COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = cat.channel_mapped
+
+    WHERE (units_current > 0 OR units_prior > 0)
+
+    GROUP BY 
+        COALESCE(current.snapshot_month, prior.snapshot_month_py),
+        COALESCE(current.product_id, prior.product_id),
+        pm.item_name, pm.manufacturer_name, pm.product_type, pm.product_group,
+        pm.product_group_desc, pm.is_deleted, pm.is_discontinued, pm.discontinued_date,
+        pm.creation_date, pm.seller_name, pm.marketplace_name, pm.category_id, pm.brand_name,
+        COALESCE(current.marketplace_id, prior.marketplace_id),
+        COALESCE(current.fulfillment_channel, prior.fulfillment_channel),
+        COALESCE(current.seller_id, prior.seller_id),
+        current.views_current_seller, prior.views_prior_seller,
+        current.views_current_product, prior.views_prior_product, current.buybox_price,
+        sales_current.units_current, sales_current.units_prior,
+        sales_current.revenue_current_local, sales_current.revenue_prior_local,
+        sales_current.revenue_current_usd, sales_current.revenue_prior_usd,
+        advertising.impression_count, advertising.click_count, advertising.ad_spend_usd,
+        advertising.attributed_revenue_usd, advertising.attributed_units_sold,
+        advertising.prior_impression_count, advertising.prior_click_count,
+        advertising.prior_ad_spend_usd, advertising.prior_attributed_revenue_usd,
+        advertising.prior_attributed_units_sold
+)
+SELECT 
+    /* BASE FIELDS */
+    month, product_id, item_name, manufacturer_name, product_type, product_group,
+    product_group_desc, is_deleted, is_discontinued, discontinued_date, creation_date,
+    seller_name, marketplace_name, category_id, brand_name, marketplace_id_code,
+    channel, seller_id, seller_views_current, seller_views_prior, product_views_current,
+    product_views_prior, cumulative_prior_views, buybox_share_current, buybox_share_prior,
+    buybox_price, duplicate_channel, selection_status, units_current, units_prior,
+    revenue_current_local, revenue_prior_local, revenue_current_usd, revenue_prior_usd,
+    impression_count, click_count, ad_spend_usd, attributed_revenue_usd, attributed_units_sold,
+    prior_impression_count, prior_click_count, prior_ad_spend_usd, prior_attributed_revenue_usd,
+    prior_attributed_units_sold, market_views_current_pt, market_views_prior_pt,
+    market_units_current_pt, market_units_prior_pt, market_revenue_local_current_pt,
+    market_revenue_local_prior_pt, market_revenue_usd_current_pt, market_revenue_usd_prior_pt,
+    market_views_current_pt_total, market_views_prior_pt_total, market_units_current_pt_total,
+    market_units_prior_pt_total, market_revenue_local_current_pt_total,
+    market_revenue_local_prior_pt_total, market_revenue_usd_current_pt_total,
+    market_revenue_usd_prior_pt_total, market_units_category_current,
+    market_revenue_category_current, market_total_units_month_category_current,
+    market_total_revenue_month_category_current, market_units_category_prior,
+    market_revenue_category_prior, market_total_units_month_category_prior,
+    market_total_revenue_month_category_prior,
+    
+    /* DERIVED BASE METRICS */
+    revenue_current_usd / NULLIF(units_current, 0) AS asp_current,
+    revenue_prior_usd / NULLIF(units_prior, 0) AS asp_prior,
+    (revenue_current_usd / NULLIF(units_current, 0)) - 
+    (revenue_prior_usd / NULLIF(units_prior, 0)) AS asp_variation,
+    
+    units_current::float / NULLIF(seller_views_current, 0) AS conversion_rate_current,
+    units_prior::float / NULLIF(seller_views_prior, 0) AS conversion_rate_prior,
+    (units_current::float / NULLIF(seller_views_current, 0)) - 
+    (units_prior::float / NULLIF(seller_views_prior, 0)) AS conversion_rate_variation,
+    
+    market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0) AS market_conversion_rate_current,
+    market_units_prior_pt_total::float / NULLIF(market_views_prior_pt_total, 0) AS market_conversion_rate_prior,
+    
+    revenue_current_usd - revenue_prior_usd AS gms_variation_usd,
+    (revenue_current_usd - revenue_prior_usd) / NULLIF(revenue_prior_usd, 0) AS gms_var_yoy_pct,
+    
+    seller_views_current - seller_views_prior AS traffic_variation,
+    (seller_views_current - seller_views_prior) / NULLIF(seller_views_prior, 0) AS traffic_var_yoy_pct,
+    
+    units_current - units_prior AS units_variation,
+    (units_current - units_prior) / NULLIF(units_prior, 0) AS units_var_yoy_pct,
+    
+    buybox_share_current - buybox_share_prior AS buybox_share_variation,
+    
+    /* MOVERS & SHAKERS - 7 DRIVERS */
+    ((revenue_current_usd / NULLIF(units_current, 0)) - 
+     (revenue_prior_usd / NULLIF(units_prior, 0))) * units_current AS price_impact,
+    
+    ((units_current::float / NULLIF(seller_views_current, 0)) - 
+     (units_prior::float / NULLIF(seller_views_prior, 0))) * 
+    seller_views_current * 
+    (revenue_current_usd / NULLIF(units_current, 0)) AS conversion_impact,
+    
+    (buybox_share_current - buybox_share_prior) * 
+    seller_views_current * 
+    (units_current::float / NULLIF(seller_views_current, 0)) * 
+    (revenue_current_usd / NULLIF(units_current, 0)) AS buybox_impact,
+    
+    attributed_revenue_usd - prior_attributed_revenue_usd AS paid_traffic_impact,
+    
+    ((market_revenue_usd_current_pt_total - market_revenue_usd_prior_pt_total) / 
+     NULLIF(market_revenue_usd_prior_pt_total, 0)) * revenue_prior_usd AS market_trends_impact,
+    
+    ((seller_views_current - seller_views_prior) * 
+     (units_current::float / NULLIF(seller_views_current, 0)) * 
+     (revenue_current_usd / NULLIF(units_current, 0))) - 
+    (attributed_revenue_usd - prior_attributed_revenue_usd) AS organic_traffic_impact,
+    
+    /* ADVERTISING METRICS */
+    ad_spend_usd / NULLIF(attributed_revenue_usd, 0) AS acos_current,
+    prior_ad_spend_usd / NULLIF(prior_attributed_revenue_usd, 0) AS acos_prior,
+    (ad_spend_usd / NULLIF(attributed_revenue_usd, 0)) - 
+    (prior_ad_spend_usd / NULLIF(prior_attributed_revenue_usd, 0)) AS acos_variation,
+    
+    attributed_revenue_usd / NULLIF(ad_spend_usd, 0) AS roas_current,
+    prior_attributed_revenue_usd / NULLIF(prior_ad_spend_usd, 0) AS roas_prior,
+    (attributed_revenue_usd / NULLIF(ad_spend_usd, 0)) - 
+    (prior_attributed_revenue_usd / NULLIF(prior_ad_spend_usd, 0)) AS roas_variation,
+    
+    click_count::float / NULLIF(impression_count, 0) AS ctr_current,
+    prior_click_count::float / NULLIF(prior_impression_count, 0) AS ctr_prior,
+    (click_count::float / NULLIF(impression_count, 0)) - 
+    (prior_click_count::float / NULLIF(prior_impression_count, 0)) AS ctr_variation,
+    
+    ad_spend_usd / NULLIF(click_count, 0) AS cpc_current,
+    prior_ad_spend_usd / NULLIF(prior_click_count, 0) AS cpc_prior,
+    (ad_spend_usd / NULLIF(click_count, 0)) - 
+    (prior_ad_spend_usd / NULLIF(prior_click_count, 0)) AS cpc_variation,
+    
+    attributed_units_sold::float / NULLIF(click_count, 0) AS ads_conversion_rate_current,
+    prior_attributed_units_sold::float / NULLIF(prior_click_count, 0) AS ads_conversion_rate_prior,
+    
+    /* MARKET SHARE METRICS */
+    revenue_current_usd / NULLIF(market_revenue_usd_current_pt_total, 0) AS market_share_current,
+    revenue_prior_usd / NULLIF(market_revenue_usd_prior_pt_total, 0) AS market_share_prior,
+    (revenue_current_usd / NULLIF(market_revenue_usd_current_pt_total, 0)) - 
+    (revenue_prior_usd / NULLIF(market_revenue_usd_prior_pt_total, 0)) AS market_share_variation,
+    
+    /* PERFORMANCE VS MARKET */
+    (units_current::float / NULLIF(seller_views_current, 0)) - 
+    (market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0)) AS conversion_vs_market,
+    
+    (market_revenue_usd_current_pt_total - market_revenue_usd_prior_pt_total) / 
+    NULLIF(market_revenue_usd_prior_pt_total, 0) AS market_growth_rate,
+    
+    ((revenue_current_usd - revenue_prior_usd) / NULLIF(revenue_prior_usd, 0)) - 
+    ((market_revenue_usd_current_pt_total - market_revenue_usd_prior_pt_total) / 
+     NULLIF(market_revenue_usd_prior_pt_total, 0)) AS growth_vs_market,
+    
+    /* BUYBOX STRATEGY METRICS */
+    (revenue_current_usd / NULLIF(units_current, 0)) - buybox_price AS price_decrease_required,
+    
+    0.20 * seller_views_current * 
+    (units_current::float / NULLIF(seller_views_current, 0)) * 
+    (revenue_current_usd / NULLIF(units_current, 0)) AS potential_monthly_uplift_20pct,
+    
+    0.50 * seller_views_current * 
+    (units_current::float / NULLIF(seller_views_current, 0)) * 
+    (revenue_current_usd / NULLIF(units_current, 0)) AS potential_monthly_uplift_50pct,
+    
+    (1.0 - buybox_share_current) * seller_views_current * 
+    (units_current::float / NULLIF(seller_views_current, 0)) * 
+    (revenue_current_usd / NULLIF(units_current, 0)) AS potential_monthly_uplift_full_buybox,
+    
+    /* FBA PITCHING METRICS */
+    (market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0)) - 
+    (units_current::float / NULLIF(seller_views_current, 0)) AS conversion_gap_vs_market,
+    
+    CASE 
+        WHEN channel = 'MFN' 
+        AND (units_current::float / NULLIF(seller_views_current, 0)) < 
+            (market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0))
+        AND seller_views_current > 0
         THEN 'Y'
         ELSE 'N'
-    END AS duplicate_channel,
+    END AS fba_opportunity_flag,
     
-    /* SELECTION LOGIC */
+    /* PRODUCT LIFECYCLE METRICS */
+    DATEDIFF(day, creation_date, month) AS product_age_days,
+    
     CASE 
-        WHEN (current.views_current_seller / NULLIF(prior.views_prior_seller,0) - 1 < -0.975) 
-             OR pm.is_discontinued = 'Y' 
-             OR pm.is_deleted = 'Y'
-             OR (current.views_current_seller = 0 AND prior.views_prior_seller = 0)
-        THEN 'Dismissed Selection' 
-        
-        WHEN (
-            SUM(prior.views_prior_seller) OVER (
-                PARTITION BY COALESCE(current.product_id, prior.product_id),
-                             COALESCE(current.marketplace_id, prior.marketplace_id)
-            ) < 1 
-            OR (prior.views_prior_seller IS NULL 
-                AND current.views_current_seller > 0 
-                AND pm.creation_date < '2025-01-01')
-        )
-        THEN 'New Offers'
-        
-        WHEN (
-            SUM(prior.views_prior_seller) OVER (
-                PARTITION BY COALESCE(current.product_id, prior.product_id),
-                             COALESCE(current.marketplace_id, prior.marketplace_id)
-            ) < 1 
-            OR (prior.views_prior_seller IS NULL 
-                AND current.views_current_seller > 0 
-                AND pm.creation_date > '2025-01-01')
-        )
-        THEN 'New Created Products'
-        
-        ELSE 'Current Product Selection'
-    END AS selection_status,
+        WHEN DATEDIFF(day, creation_date, month) <= 30 THEN 'New (0-30 days)'
+        WHEN DATEDIFF(day, creation_date, month) <= 90 THEN 'Growing (31-90 days)'
+        WHEN DATEDIFF(day, creation_date, month) <= 180 THEN 'Established (91-180 days)'
+        WHEN DATEDIFF(day, creation_date, month) <= 365 THEN 'Mature (181-365 days)'
+        ELSE 'Legacy (365+ days)'
+    END AS product_lifecycle_stage,
     
-    /* SALES METRICS */
-    COALESCE(sales_current.units_current,0) AS units_current,
-    COALESCE(sales_current.units_prior,0) AS units_prior,
-    COALESCE(sales_current.revenue_current_local,0) AS revenue_current_local,
-    COALESCE(sales_current.revenue_prior_local,0) AS revenue_prior_local,
-    COALESCE(sales_current.revenue_current_usd,0) AS revenue_current_usd,
-    COALESCE(sales_current.revenue_prior_usd,0) AS revenue_prior_usd,
-    
-    /* ADS RAW METRICS */
-    advertising.impression_count,
-    advertising.click_count,
-    advertising.ad_spend_usd,
-    advertising.attributed_revenue_usd,
-    advertising.attributed_units_sold,
-    advertising.prior_impression_count,
-    advertising.prior_click_count,
-    advertising.prior_ad_spend_usd,
-    advertising.prior_attributed_revenue_usd,
-    advertising.prior_attributed_units_sold,
-    
-    /* ADS DERIVED METRICS */
-    COALESCE(sales_current.units_current, 0)::float / NULLIF(COALESCE(current.views_current_seller, 0), 0) AS conversion_rate_current,
-    COALESCE(sales_current.units_prior, 0)::float / NULLIF(COALESCE(prior.views_prior_seller, 0), 0) AS conversion_rate_prior,
+    /* PERFORMANCE FLAGS */
     CASE 
-        WHEN COALESCE(sales_current.units_current, 0) = 0 OR COALESCE(current.views_current_seller, 0) = 0 THEN 0
-        ELSE COALESCE(advertising.attributed_units_sold, 0)::float / NULLIF(
-            COALESCE(sales_current.units_current, 0)::float / NULLIF(COALESCE(current.views_current_seller, 0), 0),
-            0
-        )
-    END AS ads_views_current,
+        WHEN (units_current::float / NULLIF(seller_views_current, 0)) > 
+             (market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0))
+        AND (revenue_current_usd - revenue_prior_usd) > 0
+        THEN 'Y'
+        ELSE 'N'
+    END AS high_performer_flag,
+    
     CASE 
-        WHEN COALESCE(sales_current.units_prior, 0) = 0 OR COALESCE(prior.views_prior_seller, 0) = 0 THEN 0
-        ELSE COALESCE(advertising.prior_attributed_units_sold, 0)::float / NULLIF(
-            COALESCE(sales_current.units_prior, 0)::float / NULLIF(COALESCE(prior.views_prior_seller, 0), 0),
-            0
-        )
-    END AS ads_views_prior,
+        WHEN (units_current::float / NULLIF(seller_views_current, 0)) < 
+             (market_units_current_pt_total::float / NULLIF(market_views_current_pt_total, 0))
+        AND (revenue_current_usd - revenue_prior_usd) < 0
+        THEN 'Y'
+        ELSE 'N'
+    END AS underperformer_flag,
     
-    /* MARKET-LEVEL METRICS - AGGREGATED */
-    SUM(market.views_current) AS market_views_current_pt,
-    SUM(market.views_prior) AS market_views_prior_pt,
-    SUM(market.units_current) AS market_units_current_pt,
-    SUM(market.units_prior) AS market_units_prior_pt,
-    SUM(market.revenue_current) AS market_revenue_local_current_pt,
-    SUM(market.revenue_prior) AS market_revenue_local_prior_pt,
-    SUM(market.revenue_usd_current) AS market_revenue_usd_current_pt,
-    SUM(market.revenue_usd_prior) AS market_revenue_usd_prior_pt,
-    
-    /* MARKET-LEVEL METRICS - SUMOVER BY MONTH, PRODUCT TYPE, MARKETPLACE */
-    SUM(SUM(market.views_current)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_views_current_pt_total,
-    SUM(SUM(market.views_prior)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_views_prior_pt_total,
-    SUM(SUM(market.units_current)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_units_current_pt_total,
-    SUM(SUM(market.units_prior)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_units_prior_pt_total,
-    SUM(SUM(market.revenue_current)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_revenue_local_current_pt_total,
-    SUM(SUM(market.revenue_prior)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_revenue_local_prior_pt_total,
-    SUM(SUM(market.revenue_usd_current)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_revenue_usd_current_pt_total,
-    SUM(SUM(market.revenue_usd_prior)) OVER (
-        PARTITION BY COALESCE(current.snapshot_month, prior.snapshot_month_py),
-                     pm.product_type,
-                     COALESCE(current.marketplace_id, prior.marketplace_id)
-    ) AS market_revenue_usd_prior_pt_total,
+    CASE WHEN buybox_share_current < 0.70 THEN 'Y' ELSE 'N' END AS low_buybox_flag,
+    CASE WHEN (ad_spend_usd / NULLIF(attributed_revenue_usd, 0)) > 0.30 THEN 'Y' ELSE 'N' END AS high_acos_flag,
+    CASE WHEN (attributed_revenue_usd / NULLIF(ad_spend_usd, 0)) < 3.0 AND ad_spend_usd > 0 THEN 'Y' ELSE 'N' END AS low_roas_flag,
+    CASE WHEN ((seller_views_current - seller_views_prior) / NULLIF(seller_views_prior, 0)) < -0.20 THEN 'Y' ELSE 'N' END AS traffic_drop_flag,
     
     /* CATEGORY METRICS */
-    SUM(cat.units_current) AS market_units_category_current,
-    SUM(cat.revenue_current) AS market_revenue_category_current,
-    SUM(cat.total_units_per_month_category) AS market_total_units_month_category_current,
-    SUM(cat.total_revenue_per_month_category) AS market_total_revenue_month_category_current,
-    SUM(cat.units_prior) AS market_units_category_prior,
-    SUM(cat.revenue_prior) AS market_revenue_category_prior,
-    SUM(cat.total_units_per_month_category_prior) AS market_total_units_month_category_prior,
-    SUM(cat.total_revenue_per_month_category_prior) AS market_total_revenue_month_category_prior
-
+    revenue_current_usd / NULLIF(market_total_revenue_month_category_current, 0) AS category_market_share_current,
+    revenue_prior_usd / NULLIF(market_total_revenue_month_category_prior, 0) AS category_market_share_prior,
     
-FROM public.product_views_table_prior prior
-FULL OUTER JOIN public.product_views_table_current current
-    ON current.snapshot_month = prior.snapshot_month_py
-    AND current.product_id = prior.product_id
-    AND current.marketplace_id = prior.marketplace_id
-    AND current.fulfillment_channel = prior.fulfillment_channel
-LEFT JOIN public.seller_product_sales_combined sales_current
-    ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = sales_current.activity_month
-    AND COALESCE(current.product_id, prior.product_id) = sales_current.product_id
-    AND COALESCE(current.marketplace_id, prior.marketplace_id) = sales_current.marketplace_id
-    AND COALESCE(current.seller_id, prior.seller_id) = sales_current.seller_id
-    AND CASE 
-        WHEN COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = 'AFN' THEN 'FBA'
-        ELSE COALESCE(current.fulfillment_channel, prior.fulfillment_channel)
-    END = sales_current.channel
-LEFT JOIN advertising
-    ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = advertising.month
-    AND COALESCE(current.product_id, prior.product_id) = advertising.product_id
-    AND COALESCE(current.marketplace_id, prior.marketplace_id) = advertising.marketplace_id
-    AND COALESCE(current.seller_id, prior.seller_id) = advertising.advertiser_id
-LEFT JOIN productmap pm 
-    ON COALESCE(current.product_id, prior.product_id) = pm.product_id
-    AND COALESCE(current.marketplace_id, prior.marketplace_id) = pm.marketplace_id
-    AND COALESCE(current.seller_id, prior.seller_id) = pm.seller_id
-FULL OUTER JOIN public.market_performance_combined market
-    ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = market.activity_month
-    AND COALESCE(current.marketplace_id, prior.marketplace_id) = market.marketplace_id
-    AND pm.product_type = market.product_type
-    AND COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = market.fulfillment_channel
-LEFT JOIN market_category_level cat 
-    ON COALESCE(current.snapshot_month, prior.snapshot_month_py) = cat.activity_month
-    AND COALESCE(current.marketplace_id, prior.marketplace_id) = cat.marketplace_id
-    AND pm.category_id = cat.category_id 
-    AND COALESCE(current.fulfillment_channel, prior.fulfillment_channel) = cat.channel_mapped
+    /* RANKING METRICS */
+    RANK() OVER (PARTITION BY month, product_type, marketplace_id_code ORDER BY revenue_current_usd DESC) AS revenue_rank_within_product_type,
+    RANK() OVER (PARTITION BY month, product_type, marketplace_id_code ORDER BY units_current::float / NULLIF(seller_views_current, 0) DESC) AS conversion_rank_within_product_type,
+    RANK() OVER (PARTITION BY month, product_type, marketplace_id_code ORDER BY buybox_share_current DESC) AS buybox_rank_within_product_type,
+    RANK() OVER (PARTITION BY month, product_type, marketplace_id_code ORDER BY (revenue_current_usd - revenue_prior_usd) / NULLIF(revenue_prior_usd, 0) DESC) AS growth_rank_within_product_type
 
-WHERE (units_current > 0 OR units_prior > 0)
-
-GROUP BY 
-    COALESCE(current.snapshot_month, prior.snapshot_month_py),
-    COALESCE(current.product_id, prior.product_id),
-    pm.item_name,
-    pm.manufacturer_name,
-    pm.product_type,
-    pm.product_group,
-    pm.product_group_desc,
-    pm.is_deleted,
-    pm.is_discontinued,
-    pm.discontinued_date,
-    pm.creation_date,
-    pm.seller_name,
-    pm.marketplace_name,
-    pm.category_id,
-    pm.brand_name,
-    COALESCE(current.marketplace_id, prior.marketplace_id),
-    COALESCE(current.fulfillment_channel, prior.fulfillment_channel),
-    COALESCE(current.seller_id, prior.seller_id),
-    current.views_current_seller,
-    prior.views_prior_seller,
-    current.views_current_product,
-    prior.views_prior_product,
-    current.buybox_price,
-    sales_current.units_current,
-    sales_current.units_prior,
-    sales_current.revenue_current_local,
-    sales_current.revenue_prior_local,
-    sales_current.revenue_current_usd,
-    sales_current.revenue_prior_usd,
-    advertising.impression_count,
-    advertising.click_count,
-    advertising.ad_spend_usd,
-    advertising.attributed_revenue_usd,
-    advertising.attributed_units_sold,
-    advertising.prior_impression_count,
-    advertising.prior_click_count,
-    advertising.prior_ad_spend_usd,
-    advertising.prior_attributed_revenue_usd,
-    advertising.prior_attributed_units_sold
+FROM base_metrics
 ;
 
 GRANT SELECT ON public.product_performance_combined TO public;
